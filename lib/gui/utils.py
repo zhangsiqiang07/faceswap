@@ -2,14 +2,19 @@
 """ Utility functions for the GUI """
 import logging
 import os
+import platform
 import sys
 import tkinter as tk
-from tkinter import filedialog
+
+from tkinter import filedialog, ttk
 from threading import Event, Thread
 from queue import Queue
+
 import numpy as np
 
 from PIL import Image, ImageDraw, ImageTk
+
+from lib.serializer import get_serializer
 
 from ._config import Config as UserConfig
 from .project import Project, Tasks
@@ -17,10 +22,11 @@ from .project import Project, Tasks
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 _CONFIG = None
 _IMAGES = None
+_PREVIEW_TRIGGER = None
 PATHCACHE = os.path.join(os.path.realpath(os.path.dirname(sys.argv[0])), "lib", "gui", ".cache")
 
 
-def initialize_config(root, cli_opts, statusbar, session):
+def initialize_config(root, cli_opts, statusbar):
     """ Initialize the GUI Master :class:`Config` and add to global constant.
 
     This should only be called once on first GUI startup. Future access to :class:`Config`
@@ -34,15 +40,13 @@ def initialize_config(root, cli_opts, statusbar, session):
         The command line options object
     statusbar: :class:`lib.gui.custom_widgets.StatusBar`
         The GUI Status bar
-    session: :class:`lib.gui.stats.Session`
-        The current training Session
     """
     global _CONFIG  # pylint: disable=global-statement
     if _CONFIG is not None:
         return None
     logger.debug("Initializing config: (root: %s, cli_opts: %s, "
-                 "statusbar: %s, session: %s)", root, cli_opts, statusbar, session)
-    _CONFIG = Config(root, cli_opts, statusbar, session)
+                 "statusbar: %s)", root, cli_opts, statusbar)
+    _CONFIG = Config(root, cli_opts, statusbar)
     return _CONFIG
 
 
@@ -86,20 +90,21 @@ class FileHandler():  # pylint:disable=too-few-public-methods
 
     Parameters
     ----------
-    handletype: ['open', 'save', 'filename', 'filename_multi', 'savefilename', 'context']
+    handle_type: ['open', 'save', 'filename', 'filename_multi', 'savefilename', 'context', `dir`]
         The type of file dialog to return. `open` and `save` will perform the open and save actions
         and return the file. `filename` returns the filename from an `open` dialog.
         `filename_multi` allows for multi-selection of files and returns a list of files selected.
         `savefilename` returns the filename from a `save as` dialog. `context` is a context
-        sensitive parameter that returns a certain dialog based on the current options
-    filetype: ['default', 'alignments', 'config_project', 'config_task', 'config_all', 'csv', \
+        sensitive parameter that returns a certain dialog based on the current options. `dir` asks
+        for a folder location.
+    file_type: ['default', 'alignments', 'config_project', 'config_task', 'config_all', 'csv', \
                'image', 'ini', 'state', 'log', 'video']
         The type of file that this dialog is for. `default` allows selection of any files. Other
         options limit the file type selection
     title: str, optional
         The title to display on the file dialog. If `None` then the default title will be used.
         Default: ``None``
-    initialdir: str, optional
+    initial_folder: str, optional
         The folder to initially open with the file dialog. If `None` then tkinter will decide.
         Default: ``None``
     command: str, optional
@@ -123,15 +128,20 @@ class FileHandler():  # pylint:disable=too-few-public-methods
     '/path/to/selected/video.mp4'
     """
 
-    def __init__(self, handletype, filetype, title=None, initialdir=None, command=None,
+    def __init__(self, handle_type, file_type, title=None, initial_folder=None, command=None,
                  action=None, variable=None):
-        logger.debug("Initializing %s: (Handletype: '%s', filetype: '%s', title: '%s', "
-                     "initialdir: '%s, 'command: '%s', action: '%s', variable: %s)",
-                     self.__class__.__name__, handletype, filetype, title, initialdir, command,
-                     action, variable)
-        self._handletype = handletype
+        logger.debug("Initializing %s: (handle_type: '%s', file_type: '%s', title: '%s', "
+                     "initial_folder: '%s, 'command: '%s', action: '%s', variable: %s)",
+                     self.__class__.__name__, handle_type, file_type, title, initial_folder,
+                     command, action, variable)
+        self._handletype = handle_type
         self._defaults = self._set_defaults()
-        self._kwargs = self._set_kwargs(title, initialdir, filetype, command, action, variable)
+        self._kwargs = self._set_kwargs(title,
+                                        initial_folder,
+                                        file_type,
+                                        command,
+                                        action,
+                                        variable)
         self.retfile = getattr(self, "_{}".format(self._handletype.lower()))()
         logger.debug("Initialized %s", self.__class__.__name__)
 
@@ -139,65 +149,66 @@ class FileHandler():  # pylint:disable=too-few-public-methods
     def _filetypes(self):
         """ dict: The accepted extensions for each file type for opening/saving """
         all_files = ("All files", "*.*")
-        filetypes = {"default": (all_files,),
-                     "alignments": [("Faceswap Alignments", "*.fsa"),
-                                    all_files],
-                     "config_project": [("Faceswap Project files", "*.fsw"), all_files],
-                     "config_task": [("Faceswap Task files", "*.fst"), all_files],
-                     "config_all": [("Faceswap Project and Task files", "*.fst *.fsw"), all_files],
-                     "csv": [("Comma separated values", "*.csv"), all_files],
-                     "image": [("Bitmap", "*.bmp"),
-                               ("JPG", "*.jpeg *.jpg"),
-                               ("PNG", "*.png"),
-                               ("TIFF", "*.tif *.tiff"),
-                               all_files],
-                     "ini": [("Faceswap config files", "*.ini"), all_files],
-                     "state": [("State files", "*.json"), all_files],
-                     "log": [("Log files", "*.log"), all_files],
-                     "video": [("Audio Video Interleave", "*.avi"),
-                               ("Flash Video", "*.flv"),
-                               ("Matroska", "*.mkv"),
-                               ("MOV", "*.mov"),
-                               ("MP4", "*.mp4"),
-                               ("MPEG", "*.mpeg *.mpg *.ts *.vob"),
-                               ("WebM", "*.webm"),
-                               ("Windows Media Video", "*.wmv"),
-                               all_files]}
-        # Add in multi-select options
-        for key, val in filetypes.items():
-            if len(val) < 3:
-                continue
-            multi = ["{} Files".format(key.title())]
-            multi.append(" ".join([ftype[1] for ftype in val if ftype[0] != "All files"]))
-            val.insert(0, tuple(multi))
+        filetypes = dict(
+            default=(all_files,),
+            alignments=[("Faceswap Alignments", "*.fsa"), all_files],
+            config_project=[("Faceswap Project files", "*.fsw"), all_files],
+            config_task=[("Faceswap Task files", "*.fst"), all_files],
+            config_all=[("Faceswap Project and Task files", "*.fst *.fsw"), all_files],
+            csv=[("Comma separated values", "*.csv"), all_files],
+            image=[("Bitmap", "*.bmp"),
+                   ("JPG", "*.jpeg *.jpg"),
+                   ("PNG", "*.png"),
+                   ("TIFF", "*.tif *.tiff"),
+                   all_files],
+            ini=[("Faceswap config files", "*.ini"), all_files],
+            model=[("Keras model files", "*.h5"), all_files],
+            state=[("State files", "*.json"), all_files],
+            log=[("Log files", "*.log"), all_files],
+            video=[("Audio Video Interleave", "*.avi"),
+                   ("Flash Video", "*.flv"),
+                   ("Matroska", "*.mkv"),
+                   ("MOV", "*.mov"),
+                   ("MP4", "*.mp4"),
+                   ("MPEG", "*.mpeg *.mpg *.ts *.vob"),
+                   ("WebM", "*.webm"),
+                   ("Windows Media Video", "*.wmv"),
+                   all_files])
+
+        # Add in multi-select options and upper case extensions for Linux
+        for key in filetypes:
+            if platform.system() == "Linux":
+                filetypes[key] = [item
+                                  if item[0] == "All files"
+                                  else (item[0], "{} {}".format(item[1], item[1].upper()))
+                                  for item in filetypes[key]]
+            if len(filetypes[key]) > 2:
+                multi = ["{} Files".format(key.title())]
+                multi.append(" ".join([ftype[1]
+                                       for ftype in filetypes[key] if ftype[0] != "All files"]))
+                filetypes[key].insert(0, tuple(multi))
         return filetypes
 
     @property
     def _contexts(self):
         """dict: Mapping of commands, actions and their corresponding file dialog for context
         handle types. """
-        return {
-            "effmpeg": {
-                "input": {
-                    "extract": "filename",
-                    "gen-vid": "dir",
-                    "get-fps": "filename",
-                    "get-info": "filename",
-                    "mux-audio": "filename",
-                    "rescale": "filename",
-                    "rotate": "filename",
-                    "slice": "filename"},
-                "output": {
-                    "extract": "dir",
-                    "gen-vid": "savefilename",
-                    "get-fps": "nothing",
-                    "get-info": "nothing",
-                    "mux-audio": "savefilename",
-                    "rescale": "savefilename",
-                    "rotate": "savefilename",
-                    "slice": "savefilename"}
-                }
-            }
+        return dict(effmpeg=dict(input={"extract": "filename",
+                                        "gen-vid": "dir",
+                                        "get-fps": "filename",
+                                        "get-info": "filename",
+                                        "mux-audio": "filename",
+                                        "rescale": "filename",
+                                        "rotate": "filename",
+                                        "slice": "filename"},
+                                 output={"extract": "dir",
+                                         "gen-vid": "savefilename",
+                                         "get-fps": "nothing",
+                                         "get-info": "nothing",
+                                         "mux-audio": "savefilename",
+                                         "rescale": "savefilename",
+                                         "rotate": "savefilename",
+                                         "slice": "savefilename"}))
 
     def _set_defaults(self):
         """ Set the default file type for the file dialog. Generally the first found file type
@@ -208,7 +219,7 @@ class FileHandler():  # pylint:disable=too-few-public-methods
         dict:
             The default file extension for each file type
         """
-        defaults = {key: val[0][1].replace("*", "")
+        defaults = {key: next(ext for ext in val[0][1].split(" ")).replace("*", "")
                     for key, val in self._filetypes.items()}
         defaults["default"] = None
         defaults["video"] = ".mp4"
@@ -240,7 +251,7 @@ class FileHandler():  # pylint:disable=too-few-public-methods
         if self._handletype.lower() in (
                 "open", "save", "filename", "filename_multi", "savefilename"):
             kwargs["filetypes"] = self._filetypes[filetype]
-            if self._defaults.get(filetype, None):
+            if self._defaults.get(filetype):
                 kwargs['defaultextension'] = self._defaults[filetype]
         if self._handletype.lower() == "save":
             kwargs["mode"] = "w"
@@ -480,7 +491,6 @@ class Images():
         gui_preview = os.path.join(self._pathoutput, ".gui_preview.jpg")
         if not image_files or (len(image_files) == 1 and gui_preview not in image_files):
             logger.debug("No preview to display")
-            self._previewoutput = None
             return
         # Filter to just the gui_preview if it exists in folder output
         image_files = [gui_preview] if gui_preview in image_files else image_files
@@ -490,7 +500,14 @@ class Images():
         if not image_files:
             return
 
-        self._load_images_to_cache(image_files, frame_dims, thumbnail_size)
+        if not self._load_images_to_cache(image_files, frame_dims, thumbnail_size):
+            logger.debug("Failed to load any preview images")
+            if gui_preview in image_files:
+                # Reset last modified for failed loading of a gui preview image so it is picked
+                # up next time
+                self._previewcache["modified"] = None
+            return
+
         if image_files == [gui_preview]:
             # Delete the preview image so that the main scripts know to output another
             logger.debug("Deleting preview image")
@@ -542,18 +559,30 @@ class Images():
             The (width (`int`), height (`int`)) of the display panel that will display the preview
         thumbnail_size: int
             The size of each thumbnail that should be created
+
+        Returns
+        -------
+        bool
+            ``True`` if images were successfully loaded to cache otherwise ``False``
         """
         logger.debug("Number image_files: %s, frame_dims: %s, thumbnail_size: %s",
                      len(image_files), frame_dims, thumbnail_size)
         num_images = (frame_dims[0] // thumbnail_size) * (frame_dims[1] // thumbnail_size)
         logger.debug("num_images: %s", num_images)
         if num_images == 0:
-            return
+            return False
         samples = list()
         start_idx = len(image_files) - num_images if len(image_files) > num_images else 0
         show_files = sorted(image_files, key=os.path.getctime)[start_idx:]
+        dropped_files = list()
         for fname in show_files:
-            img = Image.open(fname)
+            try:
+                img = Image.open(fname)
+            except PermissionError as err:
+                logger.debug("Permission error opening preview file: '%s'. Original error: %s",
+                             fname, str(err))
+                dropped_files.append(fname)
+                continue
             width, height = img.size
             scaling = thumbnail_size / max(width, height)
             logger.debug("image width: %s, height: %s, scaling: %s", width, height, scaling)
@@ -567,7 +596,16 @@ class Images():
             draw = ImageDraw.Draw(img)
             draw.rectangle(((0, 0), (thumbnail_size, thumbnail_size)), outline="#E5E5E5", width=1)
             samples.append(np.array(img))
+
         samples = np.array(samples)
+        if not np.any(samples):
+            logger.debug("No preview images collected.")
+            return False
+
+        if dropped_files:
+            logger.debug("Removing dropped files: %s", dropped_files)
+            show_files = [fname for fname in show_files if fname not in dropped_files]
+
         self._previewcache["filenames"] = (self._previewcache["filenames"] +
                                            show_files)[-num_images:]
         cache = self._previewcache["images"]
@@ -579,6 +617,7 @@ class Images():
             cache = np.concatenate((cache, samples))[-num_images:]
         self._previewcache["images"] = cache
         logger.debug("Cache shape: %s", self._previewcache["images"].shape)
+        return True
 
     def _place_previews(self, frame_dims):
         """ Format the preview thumbnails stored in the cache into a grid fitting the display
@@ -754,16 +793,15 @@ class Config():
         The command line options object
     statusbar: :class:`lib.gui.custom_widgets.StatusBar`
         The GUI Status bar
-    session: :class:`lib.gui.stats.Session`
-        The current training Session
     """
-    def __init__(self, root, cli_opts, statusbar, session):
-        logger.debug("Initializing %s: (root %s, cli_opts: %s, statusbar: %s, session: %s)",
-                     self.__class__.__name__, root, cli_opts, statusbar, session)
+    def __init__(self, root, cli_opts, statusbar):
+        logger.debug("Initializing %s: (root %s, cli_opts: %s, statusbar: %s)",
+                     self.__class__.__name__, root, cli_opts, statusbar)
+        self._default_font = tk.font.nametofont("TkDefaultFont").configure()["family"]
         self._constants = dict(
             root=root,
             scaling_factor=self._get_scaling(root),
-            default_font=tk.font.nametofont("TkDefaultFont").configure()["family"])
+            default_font=self._default_font)
         self._gui_objects = dict(
             cli_opts=cli_opts,
             tk_vars=self._set_tk_vars(),
@@ -773,8 +811,8 @@ class Config():
             status_bar=statusbar,
             command_notebook=None)  # set in command.py
         self._user_config = UserConfig(None)
-        self.session = session
-        self._default_font = tk.font.nametofont("TkDefaultFont").configure()["family"]
+        self._style = _Style(self.default_font, root)
+        self._user_theme = self._style.user_theme
         logger.debug("Initialized %s", self.__class__.__name__)
 
     # Constants
@@ -861,6 +899,11 @@ class Config():
     def user_config_dict(self):
         """ dict: The GUI config in dict form. """
         return self._user_config.config_dict
+
+    @property
+    def user_theme(self):
+        """ dict: The GUI theme selection options. """
+        return self._user_theme
 
     @property
     def default_font(self):
@@ -1008,25 +1051,21 @@ class Config():
         refreshgraph = tk.BooleanVar()
         refreshgraph.set(False)
 
-        smoothgraph = tk.DoubleVar()
-        smoothgraph.set(0.90)
-
         updatepreview = tk.BooleanVar()
         updatepreview.set(False)
 
         analysis_folder = tk.StringVar()
         analysis_folder.set(None)
 
-        tk_vars = {"display": display,
-                   "runningtask": runningtask,
-                   "istraining": istraining,
-                   "action": actioncommand,
-                   "generate": generatecommand,
-                   "consoleclear": consoleclear,
-                   "refreshgraph": refreshgraph,
-                   "smoothgraph": smoothgraph,
-                   "updatepreview": updatepreview,
-                   "analysis_folder": analysis_folder}
+        tk_vars = dict(display=display,
+                       runningtask=runningtask,
+                       istraining=istraining,
+                       action=actioncommand,
+                       generate=generatecommand,
+                       consoleclear=consoleclear,
+                       refreshgraph=refreshgraph,
+                       updatepreview=updatepreview,
+                       analysis_folder=analysis_folder)
         logger.debug(tk_vars)
         return tk_vars
 
@@ -1064,7 +1103,7 @@ class Config():
             initial_dimensions = (round(width * self.scaling_factor),
                                   round(height * self.scaling_factor))
 
-        if fullscreen and sys.platform == "win32":
+        if fullscreen and sys.platform in ("win32", "darwin"):
             self.root.state('zoomed')
         elif fullscreen:
             self.root.attributes('-zoomed', True)
@@ -1072,6 +1111,164 @@ class Config():
             self.root.geometry("{}x{}+80+80".format(str(initial_dimensions[0]),
                                                     str(initial_dimensions[1])))
         logger.debug("Geometry: %sx%s", *initial_dimensions)
+
+
+class _Style():  # pylint:disable=too-few-public-methods
+    """ Set the overarching theme and customize widgets"""
+    def __init__(self, default_font, root):
+        self._image_cache = []
+        self._root = root
+        self._font = default_font
+        default = os.path.join(PATHCACHE, "themes", "default.json")
+        self._user_theme = get_serializer("json").load(default)
+        self._style = ttk.Style()
+        self._set_styles()
+
+    @property
+    def user_theme(self):
+        """ dict: The currently selected user theme. """
+        return self._user_theme
+
+    def _config_settings_group(self):
+        """ Configures the style of the control panel entry boxes. Used for inputting Faceswap
+        options or controlling plugin settings. """
+        self._config_settings_group_common()
+        self._config_settings_group_unique()
+
+    def _config_settings_group_common(self):
+        """ Configures the group items that remain consistent, regardless of section. """
+        # Info Box
+        theme = self._user_theme["group_box"]
+        self._style.configure("InfoHeader.TFrame", background=theme["background"])
+        self._style.configure("InfoHeader.TLabel",
+                              background=theme["background"],
+                              foreground=theme["font_color"],
+                              font=(self._font[0], self._font[1], "bold"))
+        self._style.configure("InfoBody.TLabel",
+                              background=theme["background"],
+                              foreground=theme["font_color"])
+
+        # Background and Foreground of widgets and labels
+        for lbl in ["TLabel", "TFrame", "TLabelframe", "TCheckbutton", "TRadiobutton",
+                    "TLabelframe.Label"]:
+            self._style.configure(f"Group.{lbl}",
+                                  background=theme["background"],
+                                  foreground=theme["font_color"])
+        # Combobox
+        self._config_settings_group_common_combobox()
+
+    def _config_settings_group_common_combobox(self):
+        """ Combo-boxes are fairly complex to style. """
+        theme = self._user_theme["group_box"]
+        # Create a clone from clam theme
+        self._style.element_create("Group.TCombobox.field", "from", "clam")
+        # Set a layout so we can access required params
+        self._style.layout("Group.TCombobox", [
+            ("Group.TCombobox.field", {
+                "children": [
+                    ("Combobox.downarrow", {"side": "right", "sticky": "ns"}),
+                    ("Combobox.padding", {
+                        "expand": "1",
+                        "sticky": "nswe",
+                        "children": [("Combobox.focus", {
+                            "expand": "1",
+                            "sticky": "nswe",
+                            "children": [("Combobox.textarea", {"sticky": "nswe"})]})]})],
+                "sticky": "nswe"})])
+
+        # Foreground
+        self._style.configure("Group.TCombobox", foreground=theme["font_color"])
+        self._style.configure("Group.TCombobox", selectforeground=theme["font_color"])
+        # Background
+        self._style.configure("Group.TCombobox", background=theme["background"])
+        self._style.configure("Group.TCombobox", selectbackground=theme["background"])
+        self._style.map("Group.TCombobox", fieldbackground=[("readonly", theme["background"])])
+        self._style.configure("Group.TCombobox", fieldbackground=theme["background"])
+
+    def _config_settings_group_unique(self):
+        """ Configures the group items that change depending on section. These are the section
+        highlight colors.
+
+        These are the header labels on Label Frames, the Group header boxes and the slider color.
+        """
+        # Control and settings panel styles
+        for section in ("control_panel", "settings_popup"):
+            key = "CPanel" if section == "control_panel" else "SPanel"
+            theme = self._user_theme[section]
+
+            # Background colors
+            self._style.configure(f"{key}.Holder.TFrame", background=theme["secondary_color"])
+
+            # Highlight Colors
+            self._style.configure(f"{key}.Group.TLabelframe.Label",
+                                  foreground=theme["header_color"])
+            self._style.configure(f"{key}.Groupheader.TLabel",
+                                  background=theme["header_color"],
+                                  foreground=self._user_theme["group_box"]["background"],
+                                  font=(self._font[0], self._font[1], "bold"))
+
+            self._config_settings_group_slider(key, theme)
+
+    @classmethod
+    def _set_img_color(cls, img, color):
+        """Change color of PhotoImage image."""
+        pixel_line = "{" + " ".join(color for i in range(img.width())) + "}"
+        pixels = " ".join(pixel_line for i in range(img.height()))
+        img.put(pixels)
+
+    def _config_settings_group_slider(self, key, theme):
+        """ Take a copy of the default ttk.Scale widget and replace the slider element with a
+        version we can control the color and shape of.
+
+        Parameters
+        ----------
+        key: str
+            The section that the slider will belong to
+        theme: dict
+            The user configuration theme options
+        """
+        self._image_cache.extend([tk.PhotoImage(width=10, height=25),
+                                  tk.PhotoImage(width=10, height=25)])
+        img_slider, img_slider_alt = self._image_cache[-2:]
+        self._set_img_color(img_slider, theme["tertiary_color"])
+        self._set_img_color(img_slider_alt, theme["header_color"])
+
+        self._style.element_create(f"{key}.Horizontal.Scale.trough", "from", "alt")
+        self._style.element_create(f"{key}.Horizontal.Scale.slider",
+                                   "image",
+                                   img_slider,
+                                   ("active", img_slider_alt))
+
+        self._style.layout(
+            f"{key}.Horizontal.TScale",
+            [(f"{key}.Scale.focus", {
+                "expand": "1",
+                "sticky": "nswe",
+                "children": [
+                    (f"{key}.Horizontal.Scale.trough", {
+                        "expand": "1",
+                        "sticky": "nswe",
+                        "children": [
+                            (f"{key}.Horizontal.Scale.track", {"sticky": "we"}),
+                            (f"{key}.Horizontal.Scale.slider", {"side": "left", "sticky": ""})
+                            ]
+                        })
+                ]
+            })])
+
+        self._style.configure(f"{key}.Horizontal.TScale",
+                              background=self._user_theme["group_box"]["background"],
+                              groovewidth=4,
+                              troughcolor=self._user_theme["group_box"]["background"])
+
+    def _set_styles(self):
+        """ Configure widget theme and styles """
+        self._config_settings_group()
+        # Settings Popup
+        self._style.configure("SPanel.Header1.TLabel",
+                              font=(self._font[0], self._font[1] + 4, "bold"))
+        self._style.configure("SPanel.Header2.TLabel",
+                              font=(self._font[0], self._font[1] + 2, "bold"))
 
 
 class LongRunningTask(Thread):
@@ -1149,3 +1346,44 @@ class LongRunningTask(Thread):
         logger.debug("Got result from thread")
         self._config.set_cursor_default(widget=self._widget)
         return retval
+
+
+class PreviewTrigger():
+    """ Trigger to indicate to underlying Faceswap process that the preview image should
+    be updated.
+
+    Writes a file to the cache folder that is picked up by the main process.
+    """
+    def __init__(self):
+        logger.debug("Initializing: %s", self.__class__.__name__)
+        self._trigger_file = os.path.join(PATHCACHE, ".preview_trigger")
+        logger.debug("Initialized: %s (trigger_file: %s)",
+                     self.__class__.__name__, self._trigger_file)
+
+    def set(self):
+        """ Place the trigger file into the cache folder """
+        if not os.path.isfile(self._trigger_file):
+            with open(self._trigger_file, "w"):
+                pass
+            logger.debug("Set preview update trigger: %s", self._trigger_file)
+
+    def clear(self):
+        """ Remove the trigger file from the cache folder """
+        if os.path.isfile(self._trigger_file):
+            os.remove(self._trigger_file)
+            logger.debug("Removed preview update trigger: %s", self._trigger_file)
+
+
+def preview_trigger():
+    """ Set the global preview trigger if it has not always been set and return.
+
+    Returns
+    -------
+    :class:`PreviewTrigger`
+        The trigger to indicate to the main faceswap process that it should perform a training
+        preview update
+    """
+    global _PREVIEW_TRIGGER  # pylint:disable=global-statement
+    if _PREVIEW_TRIGGER is None:
+        _PREVIEW_TRIGGER = PreviewTrigger()
+    return _PREVIEW_TRIGGER

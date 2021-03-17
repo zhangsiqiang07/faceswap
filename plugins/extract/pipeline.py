@@ -52,6 +52,9 @@ class Extractor():
     multiprocess: bool, optional
         Whether to attempt processing the plugins in parallel. This may get overridden
         internally depending on the plugin combination. Default: ``False``
+    exclude_gpus: list, optional
+        A list of indices correlating to connected GPUs that Tensorflow should not use. Pass
+        ``None`` to not exclude any GPUs. Default: ``None``
     rotate_images: str, optional
         Used to set the :attr:`plugins.extract.detect.rotation` attribute. Pass in a single number
         to use increments of that size up to 360, or pass in a ``list`` of ``ints`` to enumerate
@@ -64,6 +67,9 @@ class Extractor():
     normalize_method: {`None`, 'clahe', 'hist', 'mean'}, optional
         Used to set the :attr:`plugins.extract.align.normalize_method` attribute. Normalize the
         images fed to the aligner.Default: ``None``
+    re_feed: int
+        The number of times to re-feed a slightly adjusted bounding box into the aligner.
+        Default: `0`
     image_is_aligned: bool, optional
         Used to set the :attr:`plugins.extract.mask.image_is_aligned` attribute. Indicates to the
         masker that the fed in image is an aligned face rather than a frame. Default: ``False``
@@ -74,23 +80,25 @@ class Extractor():
         The current phase that the pipeline is running. Used in conjunction with :attr:`passes` and
         :attr:`final_pass` to indicate to the caller which phase is being processed
     """
-    def __init__(self, detector, aligner, masker, configfile=None,
-                 multiprocess=False, rotate_images=None, min_size=20,
-                 normalize_method=None, image_is_aligned=False):
-        logger.debug("Initializing %s: (detector: %s, aligner: %s, masker: %s, "
-                     "configfile: %s, multiprocess: %s, rotate_images: %s, min_size: %s, "
-                     "normalize_method: %s, image_is_aligned: %s)",
-                     self.__class__.__name__, detector, aligner, masker, configfile,
-                     multiprocess, rotate_images, min_size, normalize_method, image_is_aligned)
+    def __init__(self, detector, aligner, masker, configfile=None, multiprocess=False,
+                 exclude_gpus=None, rotate_images=None, min_size=20, normalize_method=None,
+                 re_feed=0, image_is_aligned=False):
+        logger.debug("Initializing %s: (detector: %s, aligner: %s, masker: %s, configfile: %s, "
+                     "multiprocess: %s, exclude_gpus: %s, rotate_images: %s, min_size: %s, "
+                     "normalize_method: %s, re_feed: %s, image_is_aligned: %s)",
+                     self.__class__.__name__, detector, aligner, masker, configfile, multiprocess,
+                     exclude_gpus, rotate_images, min_size, normalize_method, re_feed,
+                     image_is_aligned)
         self._instance = _get_instance()
         masker = [masker] if not isinstance(masker, list) else masker
         self._flow = self._set_flow(detector, aligner, masker)
+        self._exclude_gpus = exclude_gpus
         # We only ever need 1 item in each queue. This is 2 items cached (1 in queue 1 waiting
         # for queue) at each point. Adding more just stacks RAM with no speed benefit.
         self._queue_size = 1
         self._vram_stats = self._get_vram_stats()
         self._detect = self._load_detect(detector, rotate_images, min_size, configfile)
-        self._align = self._load_align(aligner, configfile, normalize_method)
+        self._align = self._load_align(aligner, configfile, normalize_method, re_feed)
         self._mask = [self._load_mask(mask, image_is_aligned, configfile) for mask in masker]
         self._is_parallel = self._set_parallel_processing(multiprocess)
         self._phases = self._set_phases(multiprocess)
@@ -498,15 +506,17 @@ class Extractor():
         return phases
 
     # << INTERNAL PLUGIN HANDLING >> #
-    def _load_align(self, aligner, configfile, normalize_method):
+    def _load_align(self, aligner, configfile, normalize_method, re_feed):
         """ Set global arguments and load aligner plugin """
         if aligner is None or aligner.lower() == "none":
             logger.debug("No aligner selected. Returning None")
             return None
         aligner_name = aligner.replace("-", "_").lower()
         logger.debug("Loading Aligner: '%s'", aligner_name)
-        aligner = PluginLoader.get_aligner(aligner_name)(configfile=configfile,
+        aligner = PluginLoader.get_aligner(aligner_name)(exclude_gpus=self._exclude_gpus,
+                                                         configfile=configfile,
                                                          normalize_method=normalize_method,
+                                                         re_feed=re_feed,
                                                          instance=self._instance)
         return aligner
 
@@ -517,7 +527,8 @@ class Extractor():
             return None
         detector_name = detector.replace("-", "_").lower()
         logger.debug("Loading Detector: '%s'", detector_name)
-        detector = PluginLoader.get_detector(detector_name)(rotation=rotation,
+        detector = PluginLoader.get_detector(detector_name)(exclude_gpus=self._exclude_gpus,
+                                                            rotation=rotation,
                                                             min_size=min_size,
                                                             configfile=configfile,
                                                             instance=self._instance)
@@ -530,7 +541,8 @@ class Extractor():
             return None
         masker_name = masker.replace("-", "_").lower()
         logger.debug("Loading Masker: '%s'", masker_name)
-        masker = PluginLoader.get_masker(masker_name)(image_is_aligned=image_is_aligned,
+        masker = PluginLoader.get_masker(masker_name)(exclude_gpus=self._exclude_gpus,
+                                                      image_is_aligned=image_is_aligned,
                                                       configfile=configfile,
                                                       instance=self._instance)
         return masker
@@ -660,8 +672,8 @@ class ExtractMedia():
     image: :class:`numpy.ndarray`
         The original frame
     detected_faces: list, optional
-        A list of :class:`~lib.faces_detect.DetectedFace` objects. Detected faces can be added
-        later with :func:`add_detected_faces`. Default: None
+        A list of :class:`~lib.align.DetectedFace` objects. Detected faces can be added
+        later with :func:`add_detected_faces`. Default: ``None``
     """
 
     def __init__(self, filename, image, detected_faces=None):
@@ -693,7 +705,7 @@ class ExtractMedia():
 
     @property
     def detected_faces(self):
-        """list: A list of :class:`~lib.faces_detect.DetectedFace` objects in the
+        """list: A list of :class:`~lib.align.DetectedFace` objects in the
         :attr:`image`. """
         return self._detected_faces
 
@@ -720,7 +732,7 @@ class ExtractMedia():
         Parameters
         ----------
         faces: list
-            A list of :class:`~lib.faces_detect.DetectedFace` objects
+            A list of :class:`~lib.align.DetectedFace` objects
         """
         logger.trace("Adding detected faces for filename: '%s'. (faces: %s, lrtb: %s)",
                      self._filename, faces,
